@@ -1,151 +1,181 @@
 from os import system
-import re, json, traceback, logging, random, time
-from threading import Lock, Thread
+from winsound import Beep
+import re
+import json
+import traceback
+import logging
+import random
+import time
+from threading import Lock, Thread, Event
 from queue import Queue
 from requests.packages import urllib3
 from requests_html import HTMLSession, HTMLResponse
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-from utils.tool import save_txt, save_xlsx, say
+from utils.tool import save_raw, save_txt, save_xlsx, save_csv
 
 urllib3.disable_warnings()
 
-# 保证写入文件时线程安全的锁
-mutux = Lock()
+# lock for writing logs
+lock = Lock()
 
-# 保证请求URL的线程和解析响应数据的线程的同步关系的标记，false 代表请求线程结束
-flag = True
+# unfinished flag for scraping
+unfinished = Event()
 
-# 响应数据入队，以供解析响应数据的线程使用
+# store response waiting for parse
 q = Queue()
 
-# 解析响应数据时发生的异常会记录到日志中
-logging.basicConfig(filename='log.txt', level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# session pool for reuse
+sq = Queue()
 
-# 全局配置
+# consecutive request failed count
+failed_cnt = 0
+
+# global config
 cfg = {
-    # 请求URL时的配置
-    # 每个请求的最大重试次数
-    'retry': 3,
-    # 请求重试的最大等待时间
-    'wait': 3.0,
-    # 请求的时间间隔范围（最小间隔，最大间隔）
-    'interval': (0, 0),
-
-    # 记录错误信息相关文件配置
-    # 解析响应数据时发生异常，对应的报错信息存入这里
-    'log': 'log.txt',
-    # 解析响应数据时发生异常，对应的请求URL存入这里
-    'err': 'err.txt',
-    # 请求失败对应的 URL 存入这里
-    'lost': 'lost.txt',
-    # 请求 404 对应的 URL 存入这里
-    '404': '404.txt',
+    # max retry count per request
+    'retry': 2,
+    # max consecutive request failed count
+    'max_failed_count': 5,
+    # min wait seconds for next retry request
+    'wait': 3,
+    # request delay interval (min, max)
+    'interval': (0.1, 0.2),
+    'parse_worker_num': 16,
+    'log': './log/log.txt',
+    'error_while_parsing': './log/err.txt',
+    'error_while_scraping': './log/lost.txt',
+    '404': './log/404.txt',
+    'headers': {
+        'accept': '*/*',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36 Edg/108.0.1462.46'
+    },
+    'proxies': {'http': '127.0.0.1:2334', 'https': '127.0.0.1:2334'},
 }
 
+logging.basicConfig(filename=cfg['log'], level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-def get_data(pref):
+
+def get_data(pref, session=None):
+    global failed_cnt
     url = pref
     res = None
-    session = HTMLSession()
-    headers = {
-        'accept-encoding': 'utf-8',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36 Edg/92.0.',
-    }
-    try_cnt = cfg['retry'] if cfg['retry'] and cfg['retry'] > 0 else 3
-    wait_time = cfg['wait'] if cfg['wait'] and cfg['wait'] > 0 else 3.0
-    while try_cnt > 0:
+    if not session:
+        try:
+            session = sq.get(timeout=20)
+        except Exception:
+            session = HTMLSession()
+    headers = cfg.get('headers')
+    try_cnt = cfg.get('retry') if cfg.get(
+        'retry') and cfg.get('retry') > 0 else 3
+    wait_time = cfg.get('wait') if cfg.get(
+        'wait') and cfg.get('wait') > 0 else 3.0
+    while try_cnt >= 0:
         try:
             res = session.get(
                 url,
                 headers=headers,
-                timeout=20,
+                timeout=10,
                 verify=False,
-                # proxies={'http':'127.0.0.1:2334','https':'127.0.0.1:2334'}
+                proxies=cfg.get('proxies')
             )
         except Exception:
-            time.sleep(wait_time/float(try_cnt))
+            time.sleep(wait_time*random.uniform(1, 2))
             try_cnt -= 1
             continue
         if is_right(res):
+            sq.put(session)
+            failed_cnt = 0
             return res
         else:
             if no_retry(res):
                 break
-            time.sleep(wait_time/float(try_cnt))
+            time.sleep(wait_time*random.uniform(1, 2))
             try_cnt -= 1
-    mutux.acquire(10)
+    lock.acquire(10)
     try:
         if not_found(res):
             print('not found: {}'.format(url))
-            save_txt([[url]], '404.txt')
+            save_txt([[url]], cfg['404'])
         else:
             print('request failed: {}'.format(url))
-            say('request failed')
-            save_txt([[url]], 'lost.txt')
+            save_txt([[url]], cfg['error_while_scraping'])
     finally:
-        mutux.release()
+        lock.release()
+        failed_cnt += 1
+        if failed_cnt > cfg['max_failed_count']:
+            Beep(440, 1000)
+            exit(1)
+        sq.put(session)
     return None
 
 
 def is_right(res):
-    """
-    判断响应的数据是否正确
-    """
     return res and (res.status_code == 200 or res.status_code == 304)
 
 
 def no_retry(res):
-    """
-    根据响应的数据决定是否重试
-    """
     return res and (res.status_code == 404 or res.status_code == 503)
 
 
 def not_found(res):
-    """
-    判断请求的资源是否不存在
-    """
     return res and res.status_code == 404
 
 
 def parse_data(r: HTMLResponse):
     if not r:
         return None
-    title = genre = desc = tags = date = score = votes = 0
+    global failed_cnt
+    res = []
+    title = alt = id = date = year = genre = theme = sys = tags = desc = dev = pub = size = score = votes = 0
     try:
-        if r:
-            s = r.html
+        s = r.html
         if s:
-            m = s.xpath('//script[@id="jsonLdSchema"]/text()', first=True)
-            score = re.search('"ratingValue": ?(.*?),', m, re.S)
-            score = score.group(1) if score else ''
-            votes = re.search('"ratingCount": ?"(.*?)"', m, re.S)
-            votes = votes.group(1) if votes else ''
-            title = re.search('"name": ?"(.*?)"', m, re.S)
-            title = title.group(1) if title else ''
-            date = re.search('"datePublished": ?"(.*?)"', m, re.S)
-            date = date.group(1).split(' ')[0] if date else ''
-            genre = re.search('"genre": ?"(.*?)"', m, re.S)
-            genre = genre.group(1) if genre else ''
-            desc = re.search('"description": ?"(.*?)"', m, re.S)
-            desc = desc.group(1) if desc else ''
-            if not title:
-                title: str = s.xpath('//title/text()', first=True)
-                title = title.split('-')[0].strip()
-            tags = s.xpath('//ul[@class="labels"]/li/a/text()')
+            title = s.xpath(
+                '//a[@itemprop="mainEntityOfPage"]/text()', first=True)
+            dev = s.xpath(
+                '//span[@itemprop="author"]//span[@itemprop="name"]/text()', first=True)
+            pub = s.xpath(
+                '//h5[contains(text(),"Publisher")]/following-sibling::span[1]/a/text()')
+            pub = '|'.join(pub) if pub else ''
+            date = s.xpath(
+                '//time[@itemprop="datePublished"]/@datetime', first=True)
+            desc = s.xpath('//p[@itemprop="description"]/text()', first=True)
+            sys = s.xpath('//span[@itemprop="operatingSystem"]/a/text()')
+            sys = '|'.join(sys) if sys else ''
+            score = s.xpath(
+                '//meta[@itemprop="ratingValue"]/@content', first=True)
+            votes = s.xpath(
+                '//span[@itemprop="ratingCount"]/text()', first=True)
+            tags = s.xpath(
+                '//div[@id="tagsform"]//a[contains(@href, "/tags/")]/text()')
             tags = '|'.join(tags) if tags else ''
-        return [title, r.url, genre, desc, tags, date, score, votes]
+            genre = s.xpath('//span[@itemprop="genre"]/a/text()')
+            genre = '|'.join(genre) if genre else ''
+            theme = s.xpath(
+                '//h5[contains(text(),"Theme")]/following-sibling::span[1]/a/text()')
+            theme = '|'.join(theme) if theme else ''
+            engine = s.xpath(
+                '//h5[contains(text(),"Engine")]/following-sibling::span[1]/a/text()')
+            engine = '|'.join(engine) if engine else ''
+            players = s.xpath(
+                '//h5[contains(text(),"Player")]/following-sibling::span[1]/a/text()', first=True)
+            project = s.xpath(
+                '//h5[contains(text(),"Project")]/following-sibling::span[1]/a/text()', first=True)
+            return [title, r.url, genre, date, sys, project, engine, theme, tags, desc, dev, pub, players, score, votes]
+        return None
     except Exception:
         traceback.print_exc(limit=3)
-        mutux.acquire(10)
+        lock.acquire(10)
         try:
-            save_txt([[r.url]], 'err.txt')
+            save_txt([[r.url]], cfg['error_while_parsing'])
         finally:
-            mutux.release()
+            lock.release()
+            failed_cnt += 1
         logging.debug(traceback.format_exc(limit=3))
         return None
+
 
 def append_data(d: list, r):
     if not r:
@@ -158,60 +188,72 @@ def append_data(d: list, r):
     else:
         d.append([r])
 
+
 def scraper(l, i, prefs, max_workers):
-    global flag
-    min_lag, max_lag = cfg['interval'] if cfg['interval'] else (0, 0)
+    min_lag, max_lag = cfg.get('interval') if cfg.get('interval') else (0, 0)
     with ThreadPoolExecutor(max_workers) as t:
         for r in tqdm(t.map(get_data, prefs), desc='scraping...{}/{}'.format(i, l), total=len(prefs)):
             if r and all(r):
                 q.put(r)
             if max_lag > min_lag and min_lag > 0:
                 time.sleep(random.uniform(min_lag, max_lag))
-    flag = False
+    unfinished.clear()
+
+
+def parse_worker(d: list):
+    while unfinished.isSet():
+        try:
+            r = q.get(timeout=1)
+            if r:
+                append_data(d, parse_data(r))
+        except Exception:
+            pass
 
 
 def parser(d: list):
-    global flag
-    while flag:
-        if not q.empty():
-            append_data(d, parse_data(q.get()))
-    print('parsing...')
-    if q.empty():
-        return
-    l = []
-    while not q.empty():
-        l.append(q.get())
-    with ThreadPoolExecutor(16) as t:
-        for r in t.map(parse_data, l):
-            append_data(d, r)
+    with ThreadPoolExecutor(cfg['parse_worker_num']) as t:
+        for _ in range(cfg['parse_worker_num']):
+            t.submit(parse_worker, d)
 
 
 def saver(d: list, save_path: str):
     print('saving...')
-    save_xlsx(d, save_path)
+    if save_path.endswith('txt'):
+        save_txt(d, save_path)
+    elif save_path.endswith('xlsx'):
+        save_xlsx(d, save_path)
+    elif save_path.endswith('csv'):
+        save_csv(d, save_path)
+    else:
+        raise RuntimeError('not saved: unsupported file format')
 
 
 def crawl(u_list=[], save_path: str = '', chunk_size: int = 0, max_workers: int = 1):
-    """
-    此爬虫将 URL 列表分成若干块，按块依次处理并保存。
-    每块用线程池并发处理。
-
-    参数：
-    - u_list: 待爬取的 URL 列表
-    - save_path: 保存最终数据的文件路径
-    - chunk_size: URL 列表分块的大小
-    - max_workers: 线程池的最大工作线程数量
-
-    """
-    global flag
     chunks = [u_list[i:i + chunk_size]
               for i in range(0, len(u_list), chunk_size)]
+    if max_workers < 2:
+        session = HTMLSession()
+        for chunk in chunks:
+            d_list = []
+            for c in chunk:
+                print(c)
+                append_data(d_list, parse_data(get_data(c, session)))
+                min_lag, max_lag = cfg.get(
+                    'interval') if cfg.get('interval') else (0, 0)
+                if max_lag > min_lag and min_lag > 0:
+                    time.sleep(random.uniform(min_lag, max_lag))
+            saver(d_list, save_path)
+            system('cls')
+        return
+    for _ in range(0, max_workers):
+        sq.put(HTMLSession())
     for i, chunk in enumerate(chunks, 1):
-        flag = True
-        # 待保存数据的列表，列表每一项也是一个列表
+        unfinished.set()
+        # d_list: [[],[]...,[]]
         d_list = []
-        t1 = Thread(target=scraper, args=(len(chunks), i, chunk, max_workers))
-        t2 = Thread(target=parser, args=(d_list,))
+        t1 = Thread(target=scraper, args=(
+            len(chunks), i, chunk, max_workers,), daemon=True)
+        t2 = Thread(target=parser, args=(d_list,), daemon=True)
         t1.start(), t2.start()
         t1.join(), t2.join()
         saver(d_list, save_path)

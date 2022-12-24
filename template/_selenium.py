@@ -1,39 +1,49 @@
 from concurrent.futures import ThreadPoolExecutor as Pool
 from math import ceil
-from os import system
-import random
-import time
+import re
+import json
 import traceback
 import logging
-from threading import Lock, Thread
+import random
+import time
+from winsound import Beep
+from os import system
+from threading import Lock
 from msedge.selenium_tools import Edge, EdgeOptions
 from tqdm import tqdm
-from utils.tool import load_txt, save_txt, save_xlsx, say
+from utils.tool import load_txt, save_csv, save_txt, save_xlsx
 
-# 保证写入文件时线程安全的锁
-mutux = Lock()
+# lock for writing logs
+lock = Lock()
 
-# 解析响应数据时发生的异常会记录到日志中
-logging.basicConfig(filename='log.txt', level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-# 全局配置
+# consecutive request failed count
+failed_cnt = 0
+
+# global config
 cfg = {
-    # 浏览器驱动配置
-    # 浏览器启动后默认请求的URL
-    'test_url': "https://www.vgtime.com",
-    # 浏览器驱动文件位置
-    'driver_path': "C:\Program Files (x86)\Microsoft\Edge\Application\msedgedriver.exe",
-    # 浏览器选择禁止加载项，默认全部禁用（图片, CSS, JS, 扩展程序）
+    # default url for test after the browser starts
+    'test_url': '',
+    'driver_path': 'C:\Program Files (x86)\Microsoft\Edge\Application\msedgedriver.exe',
+    # choose to disable load options(picture, css, js, extension)
     'disable': (True, True, True, True),
-
-    # 请求URL时配置
-    # 每个请求的最大重试次数
+    # max retry count per request
     'retry': 3,
-    # 请求重试的最大等待时间
-    'wait': 3.0,
-    # 请求的时间间隔范围（最小间隔，最大间隔）
+    # min wait seconds for next retry request
+    'wait': 3,
+    # max consecutive request failed count
+    'max_failed_count': 5,
+    # request delay interval (min, max)
     'interval': (0, 0),
+    'log': './log/log.txt',
+    'error_while_parsing': './log/err.txt',
+    'error_while_scraping': './log/lost.txt',
+    '404': './log/404.txt',
 }
+
+logging.basicConfig(filename=cfg['log'],
+                    level=logging.ERROR,
+                    format='%(asctime)s - %(levelname)s \n %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
 
 
 def start_driver(test_url: str = '', disable: tuple = ()):
@@ -61,85 +71,114 @@ def start_driver(test_url: str = '', disable: tuple = ()):
     return driver
 
 
-def processor(pref):
-    res, driver, urls, bar = pref
+def processor(driver: Edge, urls: list, bar: tqdm):
+    global failed_cnt
+    rs = []
     max_retry = cfg['retry'] if cfg['retry'] and cfg['retry'] > 0 else 3
     wait_time = cfg['wait'] if cfg['wait'] and cfg['wait'] > 0 else 3.0
     min_lag, max_lag = cfg['interval'] if cfg['interval'] else (0, 0)
     for url in urls:
         error = False
         try_cnt = max_retry
-        while try_cnt > 0:
+        while try_cnt >= 0:
             try:
                 driver.get(url)
             except Exception:
-                time.sleep(wait_time/float(try_cnt))
+                time.sleep(wait_time*random.uniform(1, 2))
                 try_cnt -= 1
                 continue
             if is_right(driver):
-                append_data(res, parse_data(driver))
+                r = parse_data(driver)
+                if r:
+                    rs.append(r)
+                failed_cnt = 0
                 break
             else:
                 if no_retry(driver):
                     error = True
                     break
-                time.sleep(wait_time/float(try_cnt))
+                time.sleep(wait_time*random.uniform(1, 2))
                 try_cnt -= 1
-        if error or try_cnt == 0:
-            mutux.acquire(10)
+        if error or try_cnt < 0:
+            lock.acquire(10)
             try:
                 if not_found(driver):
                     print('not_found: {}'.format(url))
-                    save_txt([[url]], '404.txt')
+                    save_txt([[url]], cfg['404'])
                 else:
                     print('request failed: {}'.format(url))
-                    say('request failed')
-                    save_txt([[url]], 'lost.txt')
+                    save_txt([[url]], cfg['error_while_scraping'])
             finally:
-                mutux.release()
+                lock.release()
+                failed_cnt += 1
+                if failed_cnt > cfg['max_failed_count']:
+                    Beep(440, 1000)
+                    driver.close()
+                    exit(1)
         bar.update(1)
         if max_lag > min_lag and min_lag > 0:
             time.sleep(random.uniform(min_lag, max_lag))
+    return rs
 
 
 def is_right(driver):
-    """
-    判断响应的数据是否正确
-    """
     return True
 
 
 def no_retry(driver):
-    """
-    根据响应的数据决定是否重试
-    """
     return True
 
 
 def not_found(driver):
-    """
-    判断请求的资源是否不存在
-    """
     return False
 
 
 def parse_data(driver: Edge):
-    # title = platform = None
-    # try:
-    #     title = driver.find_element_by_xpath('//h2/a')
-    #     title = title.text if title else ''
-    #     platform = driver.find_elements_by_xpath(
-    #         '//div[@class="descri_box"]/div[@class="jizhong_tab"]/span')
-    #     platform = '|'.join(p.text for p in platform) if platform else ''
-    # except Exception:
-    #     traceback.print_exc(limit=3)
-    #     mutux.acquire(10)
-    #     try:
-    #         save_txt([[driver.current_url]], 'err.txt')
-    #     finally:
-    #         mutux.release()
-    #     logging.debug(traceback.format_exc(limit=3))
-    return ['test']
+    title = year = pub = tags = score = votes = genre = None
+    try:
+        title = xpath(driver, '//h1')
+        title = title.text if title else ''
+        year = xpath(
+            driver, '//td[contains(text(), "Release")]/following-sibling::td/a[contains(@href,"year")]')
+        year = int(year.text) if year and year.text else ''
+        pub = xpath(
+            driver, '//td[contains(text(), "Creator") or contains(text(), "Develop")]/following-sibling::td/a[contains(@href, "list.php")]')
+        pub = pub.text if pub else ''
+        genre = xpath(
+            driver, '//td[contains(text(), "Genre:")]/following-sibling::td/a[contains(@href,"genre")]')
+        genre = genre.text if genre else ''
+        tags = xpath(
+            driver, '//td[contains(text(), "Tags")]/following-sibling::td/a[contains(@href,"tags")]', False)
+        tags = '|'.join(t.text for t in tags) if tags else ''
+        script = xpath(driver, '//script[@type="application/ld+json"]')
+        script = script.get_attribute('innerHTML') if script else ''
+        p = re.search('"ratingValue":\s?"(.*?)"', script, re.S)
+        score = float(p.group(1)) if p else ''
+        q = re.search('"reviewCount":\s?"(\d+?)"', script, re.S)
+        votes = int(q.group(1)) if q else ''
+    except Exception:
+        traceback.print_exc(limit=3)
+        lock.acquire(10)
+        try:
+            save_txt([[driver.current_url]], cfg['error_while_parsing'])
+        finally:
+            lock.release()
+        logging.error(traceback.format_exc(limit=3))
+    return [title, driver.current_url, year, pub, genre, tags, score, votes]
+
+
+def xpath(driver, pattern: str, first=False, text=False):
+    e = None
+    try:
+        e = driver.find_element(
+            'xpath', pattern) if first else driver.find_elements('xpath', pattern)
+        if e and text:
+            e = [x.text if x.text else x.get_atrribute('innerHTML') for x in e] if isinstance(
+                e, list) else e.text if e.text else e.get_attribute('innerHTML')
+    except Exception:
+        logging.error(traceback.format_exc(limit=3))
+    finally:
+        return e
 
 
 def append_data(d: list, r):
@@ -156,21 +195,17 @@ def append_data(d: list, r):
 
 def saver(d: list, save_path: str):
     print('saving...')
-    save_xlsx(d, save_path)
+    if save_path.endswith('txt'):
+        save_txt(d, save_path)
+    elif save_path.endswith('xlsx'):
+        save_xlsx(d, save_path)
+    elif save_path.endswith('csv'):
+        save_csv(d, save_path)
+    else:
+        raise RuntimeError('not saved: unsupported file format')
 
 
 def crawl(u_list=[], save_path: str = '', chunk_size: int = 0, max_workers: int = 1):
-    """
-    此爬虫通过浏览器模拟用户访问资源，将 URL 列表分块依次处理并保存。
-    每块通过多个浏览器进程并行处理。
-
-    参数：
-    - u_list: 待爬取的 URL 列表
-    - save_path: 保存最终数据的文件路径
-    - chunk_size: URL 列表分块的大小
-    - max_workers: 最大工作线程数量，等于大块拆分后的小块数量
-
-    """
     chunks = [u_list[i:i + chunk_size]
               for i in range(0, len(u_list), chunk_size)]
     drivers = []
@@ -178,13 +213,13 @@ def crawl(u_list=[], save_path: str = '', chunk_size: int = 0, max_workers: int 
         drivers.append(start_driver())
     for i, chunk in enumerate(chunks, 1):
         d_list = []
-        ts: list[Thread] = []
         with tqdm(desc='scraping and parsing...{}/{}'.format(i, len(chunks)), total=len(chunk)) as bar:
             slice_size = ceil(len(chunk)/max_workers)
             slices = [chunk[i:i+slice_size]
                       for i in range(0, len(chunk), slice_size)]
-            args = ((d_list, driver, slice, bar)
-                    for driver, slice in zip(drivers, slices))
-            with Pool(max_workers) as t:t.map(processor, args)
+            with Pool(max_workers) as t:
+                for r in t.map(processor, drivers, slices, [bar]*max_workers):
+                    for x in r:
+                        append_data(d_list, x)
         saver(d_list, save_path)
         system('cls')
