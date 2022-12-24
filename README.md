@@ -2,15 +2,17 @@
 
 Simple crawler templates written by Python.
 
-简单的爬虫 Python 模板。
+简单的 Python 爬虫脚本模板，有如下特性：
+- 支持多线程请求；
+- 支持浏览器模拟请求；
+- 支持在终端显示进度条；
+- 自动记录爬取失败的 URL 和错误信息；
+- 可将数据保存到 Excel 或 csv 文件；
+- 排名脚本`rank.py`会根据数据的平均评分和评分数量使用基于用户投票的排名算法自动并且快速地对数据进行排序处理。
 
 ## 依赖
 
-- http 请求发起与响应内容解析：requests_html
-- 控制台进度条：tqdm
-- Excel文件处理：openpyxl
-- 出错信息语音播报：pyttsx3
-- 浏览器模拟：msedge.selenium_tools（配合浏览器的 driver）
+见`requirements.txt`。
 
 ## 版本
 
