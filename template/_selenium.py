@@ -41,7 +41,7 @@ cfg = {
 }
 
 logging.basicConfig(filename=cfg['log'],
-                    level=logging.ERROR,
+                    level=logging.INFO,
                     format='%(asctime)s - %(levelname)s \n %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 

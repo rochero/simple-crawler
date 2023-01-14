@@ -19,9 +19,6 @@ urllib3.disable_warnings()
 # lock for writing logs
 lock = Lock()
 
-# unfinished flag for scraping
-unfinished = Event()
-
 # store response waiting for parse
 q = Queue()
 
@@ -125,7 +122,7 @@ def not_found(res):
 
 def parse_data(r: HTMLResponse):
     if not r:
-        return None
+        raise Exception('no data')
     global failed_cnt
     res = []
     title = alt = id = date = year = genre = theme = sys = tags = desc = dev = pub = size = score = votes = 0
@@ -164,7 +161,7 @@ def parse_data(r: HTMLResponse):
             project = s.xpath(
                 '//h5[contains(text(),"Project")]/following-sibling::span[1]/a/text()', first=True)
             return [title, r.url, genre, date, sys, project, engine, theme, tags, desc, dev, pub, players, score, votes]
-        return None
+        raise Exception('no data')
     except Exception:
         traceback.print_exc(limit=3)
         lock.acquire(10)
@@ -193,18 +190,20 @@ def scraper(l, i, prefs, max_workers):
     min_lag, max_lag = cfg.get('interval') if cfg.get('interval') else (0, 0)
     with ThreadPoolExecutor(max_workers) as t:
         for r in tqdm(t.map(get_data, prefs), desc='scraping...{}/{}'.format(i, l), total=len(prefs)):
-            if r and all(r):
-                q.put(r)
+            q.put(r)
             if max_lag > min_lag and min_lag > 0:
                 time.sleep(random.uniform(min_lag, max_lag))
-    unfinished.clear()
+    q.put(object())
 
 
 def parse_worker(d: list):
-    while unfinished.isSet():
+    while True:
         try:
-            r = q.get(timeout=1)
+            r = q.get(timeout=10)
             if r:
+                if r is object():
+                    q.put(r)
+                    break
                 append_data(d, parse_data(r))
         except Exception:
             pass
@@ -248,7 +247,6 @@ def crawl(u_list=[], save_path: str = '', chunk_size: int = 0, max_workers: int 
     for _ in range(0, max_workers):
         sq.put(HTMLSession())
     for i, chunk in enumerate(chunks, 1):
-        unfinished.set()
         # d_list: [[],[]...,[]]
         d_list = []
         t1 = Thread(target=scraper, args=(
