@@ -19,5 +19,5 @@ Simple crawler templates written by Python.
 
 template 目录下：
 
-- _example.py 是主要模板，基于 requests_；
+- __example.py 是主要模板，基于 requests_；
 - _selenium.py 是备用策略，基于 selenium 模拟浏览器发起请求。
